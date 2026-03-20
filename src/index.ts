@@ -23,6 +23,7 @@ Options:
 
 Interactive commands (inside the REPL):
   /clear            Clear conversation history
+  /compact          Summarize history to free up context window
   /exit, /quit      Exit the session
   /model <name>     Switch Gemini model mid-session
 
@@ -80,7 +81,7 @@ async function printBanner(): Promise<void> {
   ╚═══════════════════════════════╝
 `));
   console.log(chalk.gray('Type your request in natural language.'));
-  console.log(chalk.gray('Commands: /clear  /model <name>  /exit\n'));
+  console.log(chalk.gray('Commands: /clear  /compact  /model <name>  /exit\n'));
 }
 
 async function main(): Promise<void> {
@@ -114,6 +115,7 @@ async function main(): Promise<void> {
   const cwd = process.cwd();
   const systemPrompt = buildSystemPrompt(cwd);
 
+  const chalk = (await import('chalk')).default;
   const agent = new GeminiAgent({ apiKey, model, systemPrompt, cwd });
 
   await printBanner();
@@ -160,6 +162,10 @@ async function main(): Promise<void> {
           await printInfo('Conversation history cleared.');
           break;
 
+        case 'compact':
+          await agent.compact();
+          break;
+
         case 'model': {
           const newModel = parts[1];
           if (!newModel) {
@@ -199,10 +205,15 @@ async function main(): Promise<void> {
     process.exit(0);
   });
 
-  // Handle Ctrl+C gracefully
+  // Handle Ctrl+C: interrupt AI response if one is in progress, otherwise show hint
   process.on('SIGINT', () => {
-    console.log('\n\nInterrupted. Type /exit to quit or press Ctrl+D.');
-    showPrompt();
+    if (agent.currentAbortController) {
+      agent.currentAbortController.abort();
+      process.stdout.write(chalk.yellow('\n⚠ Interrupted.\n'));
+    } else {
+      console.log('\n\nInterrupted. Type /exit to quit or press Ctrl+D.');
+      showPrompt();
+    }
   });
 }
 

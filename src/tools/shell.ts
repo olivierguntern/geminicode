@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { spawn } from 'child_process';
 import { askApproval, printToolCall } from '../ui.js';
 
 export async function bashCommand(command: string, cwd: string): Promise<string> {
@@ -8,21 +8,43 @@ export async function bashCommand(command: string, cwd: string): Promise<string>
   if (decision === 'quit') process.exit(0);
   if (decision === 'no') return `User declined to run command: "${command}".`;
 
-  try {
-    const output = execSync(command, {
+  return new Promise((resolve) => {
+    const child = spawn('sh', ['-c', command], {
       cwd,
-      encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 30000,
     });
-    return output || '(command completed with no output)';
-  } catch (err: unknown) {
-    if (err && typeof err === 'object' && 'stdout' in err && 'stderr' in err) {
-      const e = err as { stdout: string; stderr: string; status: number };
-      const combined = [e.stdout, e.stderr].filter(Boolean).join('\n');
-      return `Command failed (exit ${e.status}):\n${combined}`;
-    }
-    const msg = err instanceof Error ? err.message : String(err);
-    return `Command failed: ${msg}`;
-  }
+
+    let output = '';
+
+    child.stdout.on('data', (data: Buffer) => {
+      const text = data.toString();
+      process.stdout.write(text);
+      output += text;
+    });
+
+    child.stderr.on('data', (data: Buffer) => {
+      const text = data.toString();
+      process.stderr.write(text);
+      output += text;
+    });
+
+    const timer = setTimeout(() => {
+      child.kill();
+      resolve(`Command timed out after 30 seconds.\n${output}`);
+    }, 30_000);
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        resolve(`Command failed (exit ${code}):\n${output || '(no output)'}`);
+      } else {
+        resolve(output || '(command completed with no output)');
+      }
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolve(`Command failed: ${err.message}`);
+    });
+  });
 }

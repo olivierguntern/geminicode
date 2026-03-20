@@ -7,7 +7,7 @@ import {
   printError,
   printInfo,
 } from './ui.js';
-import { trimHistory } from './context.js';
+import { trimHistory, estimateTokens } from './context.js';
 import { loadHistory, saveHistory } from './history.js';
 
 export interface AgentOptions {
@@ -34,6 +34,7 @@ export class GeminiAgent {
   private systemPrompt: string;
   private cwd: string;
   private history: Content[];
+  public currentAbortController: AbortController | null = null;
 
   constructor(opts: AgentOptions) {
     this.ai = new GoogleGenAI({ apiKey: opts.apiKey });
@@ -123,6 +124,11 @@ export class GeminiAgent {
 
     // Persist history after each completed exchange
     saveHistory(this.cwd, this.history);
+
+    // Show context usage
+    const tokens = estimateTokens(this.history);
+    const pct = Math.round((tokens / 80_000) * 100);
+    await printInfo(`Context: ${(tokens / 1000).toFixed(1)}k / 80k tokens (${pct}%)`);
   }
 
   /**
@@ -135,87 +141,177 @@ export class GeminiAgent {
     // Trim history to fit within the context window
     const contents = trimHistory(this.history);
 
+    this.currentAbortController = new AbortController();
+    const { signal } = this.currentAbortController;
+
     type StreamChunk = { text?: string; functionCalls?: FunctionCall[] };
     let stream: AsyncGenerator<StreamChunk> | null = null;
 
-    for (let attempt = 0; attempt <= MAX_API_RETRIES; attempt++) {
-      if (attempt > 0) {
-        const delayMs = 1000 * 2 ** (attempt - 1); // 1s, 2s, 4s
-        await printInfo(`Retrying in ${delayMs / 1000}s… (attempt ${attempt}/${MAX_API_RETRIES})`);
-        await sleep(delayMs);
-      }
-      try {
-        stream = (await this.ai.models.generateContentStream({
-          model: this.model,
-          contents,
-          config: {
-            systemInstruction: this.systemPrompt,
-            tools: [{ functionDeclarations: toolDeclarations }],
-          },
-        })) as AsyncGenerator<StreamChunk>;
-        break; // Stream created successfully
-      } catch (err: unknown) {
-        const isLast = attempt === MAX_API_RETRIES;
-        if (!isRetryableError(err) || isLast) {
-          const msg = err instanceof Error ? err.message : String(err);
-          await printError(`Gemini API error: ${msg}`);
-          this.history.pop(); // Remove the last user turn so the user can retry
-          return null;
-        }
-        // Retryable error — loop continues
-        const msg = err instanceof Error ? err.message : String(err);
-        await printError(`Transient error: ${msg}`);
-      }
-    }
-
-    if (!stream) {
-      // Should not happen, but guard anyway
-      this.history.pop();
-      return null;
-    }
-
-    const collectedFunctionCalls: FunctionCall[] = [];
-    let streamedText = '';
-    let isFirstChunk = true;
-
     try {
-      for await (const chunk of stream) {
-        // Accumulate function calls
-        if (chunk.functionCalls && chunk.functionCalls.length > 0) {
-          collectedFunctionCalls.push(...chunk.functionCalls);
+      for (let attempt = 0; attempt <= MAX_API_RETRIES; attempt++) {
+        if (attempt > 0) {
+          const delayMs = 1000 * 2 ** (attempt - 1); // 1s, 2s, 4s
+          await printInfo(`Retrying in ${delayMs / 1000}s… (attempt ${attempt}/${MAX_API_RETRIES})`);
+          await sleep(delayMs);
         }
-
-        // Stream text to stdout
-        const t = chunk.text ?? '';
-        if (t) {
-          if (isFirstChunk) {
-            process.stdout.write('\n'); // blank line before response
-            isFirstChunk = false;
+        try {
+          stream = (await this.ai.models.generateContentStream({
+            model: this.model,
+            contents,
+            config: {
+              systemInstruction: this.systemPrompt,
+              tools: [{ functionDeclarations: toolDeclarations }],
+            },
+          })) as AsyncGenerator<StreamChunk>;
+          break; // Stream created successfully
+        } catch (err: unknown) {
+          const isLast = attempt === MAX_API_RETRIES;
+          if (!isRetryableError(err) || isLast) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await printError(`Gemini API error: ${msg}`);
+            this.history.pop(); // Remove the last user turn so the user can retry
+            return null;
           }
-          process.stdout.write(chalk.cyan(t));
-          streamedText += t;
+          // Retryable error — loop continues
+          const msg = err instanceof Error ? err.message : String(err);
+          await printError(`Transient error: ${msg}`);
         }
       }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await printError(`Streaming error: ${msg}`);
-      this.history.pop();
-      return null;
-    }
 
-    // If we got a text response, add trailing newline and save to history
-    if (streamedText) {
-      process.stdout.write('\n');
-      this.history.push({
-        role: 'model',
-        parts: [{ text: streamedText }],
-      });
-    }
+      if (!stream) {
+        // Should not happen, but guard anyway
+        this.history.pop();
+        return null;
+      }
 
-    return collectedFunctionCalls;
+      const collectedFunctionCalls: FunctionCall[] = [];
+      let streamedText = '';
+      let isFirstChunk = true;
+
+      try {
+        for await (const chunk of stream) {
+          // Stop processing if aborted (Ctrl+C)
+          if (signal.aborted) break;
+
+          // Accumulate function calls
+          if (chunk.functionCalls && chunk.functionCalls.length > 0) {
+            collectedFunctionCalls.push(...chunk.functionCalls);
+          }
+
+          // Stream text to stdout
+          const t = chunk.text ?? '';
+          if (t) {
+            if (isFirstChunk) {
+              process.stdout.write('\n'); // blank line before response
+              isFirstChunk = false;
+            }
+            process.stdout.write(chalk.cyan(t));
+            streamedText += t;
+          }
+        }
+      } catch (err: unknown) {
+        // Ignore abort errors — treat as a clean interruption
+        if (signal.aborted) {
+          if (streamedText) process.stdout.write('\n');
+          return [];
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        await printError(`Streaming error: ${msg}`);
+        this.history.pop();
+        return null;
+      }
+
+      // If aborted mid-stream, return cleanly without modifying history
+      if (signal.aborted) {
+        if (streamedText) process.stdout.write('\n');
+        return [];
+      }
+
+      // If we got a text response, add trailing newline and save to history
+      if (streamedText) {
+        process.stdout.write('\n');
+        this.history.push({
+          role: 'model',
+          parts: [{ text: streamedText }],
+        });
+      }
+
+      return collectedFunctionCalls;
+    } finally {
+      this.currentAbortController = null;
+    }
   }
 
   clearHistory(): void {
     this.history = [];
+  }
+
+  async compact(): Promise<void> {
+    if (this.history.length === 0) {
+      await printInfo('Nothing to compact — history is empty.');
+      return;
+    }
+
+    const tokensBefore = estimateTokens(this.history);
+    await printInfo('Compacting history…');
+
+    const summaryPrompt =
+      'Summarize our entire conversation so far in detail, preserving all important context, ' +
+      'file paths, decisions, and code that was discussed or written. Be thorough.';
+
+    // Temporarily push the summary request and call Gemini
+    this.history.push({ role: 'user', parts: [{ text: summaryPrompt }] });
+
+    const chalk = (await import('chalk')).default;
+    this.currentAbortController = new AbortController();
+    const { signal } = this.currentAbortController;
+
+    let summary = '';
+    let isFirstChunk = true;
+
+    try {
+      const contents = trimHistory(this.history);
+      const stream = (await this.ai.models.generateContentStream({
+        model: this.model,
+        contents,
+        config: { systemInstruction: this.systemPrompt },
+      })) as AsyncGenerator<{ text?: string }>;
+
+      process.stdout.write('\n');
+      for await (const chunk of stream) {
+        if (signal.aborted) break;
+        const t = chunk.text ?? '';
+        if (t) {
+          if (isFirstChunk) { isFirstChunk = false; }
+          process.stdout.write(chalk.cyan(t));
+          summary += t;
+        }
+      }
+      process.stdout.write('\n');
+    } catch {
+      await printError('Failed to generate summary.');
+      this.history.pop(); // remove the summary prompt we added
+      return;
+    } finally {
+      this.currentAbortController = null;
+    }
+
+    if (!summary) {
+      await printError('Empty summary returned.');
+      this.history.pop();
+      return;
+    }
+
+    // Replace entire history with the compact summary
+    this.history = [
+      { role: 'user', parts: [{ text: `<COMPACT SUMMARY>\n${summary}` }] },
+      { role: 'model', parts: [{ text: 'Summary recorded. How can I help you next?' }] },
+    ];
+
+    saveHistory(this.cwd, this.history);
+
+    const tokensAfter = estimateTokens(this.history);
+    const saved = tokensBefore - tokensAfter;
+    await printInfo(`History compacted. Saved ~${(saved / 1000).toFixed(1)}k tokens.`);
   }
 }
