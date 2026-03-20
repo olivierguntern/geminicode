@@ -9,9 +9,17 @@
   "scripts": {
     "build": "tsc",
     "dev": "ts-node src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
-  "keywords": ["gemini", "ai", "cli", "coding", "assistant"],
+  "keywords": [
+    "gemini",
+    "ai",
+    "cli",
+    "coding",
+    "assistant"
+  ],
   "license": "MIT",
   "dependencies": {
     "@google/genai": "^1.0.0",
@@ -25,7 +33,8 @@
     "@types/minimist": "^1.2.5",
     "@types/node": "^20.0.0",
     "ts-node": "^10.9.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.0"
   },
   "engines": {
     "node": ">=18.0.0"

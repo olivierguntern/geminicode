@@ -4,6 +4,7 @@ import * as readline from 'readline';
 import minimist from 'minimist';
 import { GeminiAgent } from './agent.js';
 import { printError, printInfo } from './ui.js';
+import { clearSavedHistory } from './history.js';
 
 const VERSION = '0.1.0';
 const DEFAULT_MODEL = 'gemini-2.0-flash';
@@ -155,6 +156,7 @@ async function main(): Promise<void> {
 
         case 'clear':
           agent.clearHistory();
+          clearSavedHistory(cwd);
           await printInfo('Conversation history cleared.');
           break;
 
