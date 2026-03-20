@@ -50,9 +50,15 @@ export async function editFile(
     throw new Error(`Cannot read file "${filePath}": ${msg}`);
   }
 
-  if (!content.includes(oldString)) {
+  const occurrences = content.split(oldString).length - 1;
+  if (occurrences === 0) {
     throw new Error(
-      `String not found in "${filePath}". Make sure the old_string matches exactly (including whitespace).`,
+      `String not found in "${filePath}". Make sure old_string matches exactly (including whitespace).`,
+    );
+  }
+  if (occurrences > 1) {
+    throw new Error(
+      `old_string appears ${occurrences} times in "${filePath}". Provide more surrounding context to make it unique.`,
     );
   }
 

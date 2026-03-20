@@ -163,8 +163,7 @@ async function main(): Promise<void> {
           if (!newModel) {
             await printError('Usage: /model <model-name>');
           } else {
-            // Re-create agent with new model
-            (agent as unknown as { model: string }).model = newModel;
+            agent.setModel(newModel);
             await printInfo(`Model switched to: ${newModel}`);
           }
           break;
